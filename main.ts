@@ -1,6 +1,14 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting, MarkdownView } from 'obsidian';
+import {
+	App,
+	Notice,
+	Plugin,
+	PluginSettingTab,
+	Setting,
+	MarkdownView
+} from 'obsidian';
 
 interface AutoScrollSettings {
+	/** pixels / 10ms (compat com configs antigas) */
 	speed: number;
 	showRibbonIcon: boolean;
 }
@@ -8,110 +16,321 @@ interface AutoScrollSettings {
 const DEFAULT_SETTINGS: AutoScrollSettings = {
 	speed: 0.2,
 	showRibbonIcon: true,
-}
-const ribbonActiveClassName = 'autoscroll-ribbon-active';
-const pluginId = 'autoscroll';
+};
+
+const ribbonActiveClassName = 'autoscroll-extended-ribbon-active';
+const pluginId = 'obsidian-autoscroll-extended';
+
+// atraso para considerar "parou de rolar" e retomar o autoscroll
+const WHEEL_RESUME_DELAY_MS = 300;
+
 export default class AutoScrollPlugin extends Plugin {
 	settings: AutoScrollSettings;
-	active: boolean = false;
-	intervalId: number;
-	pixelfractionCounter: number = 0;
-	ribbonIconEl: HTMLElement;
 
-	private stopScroll() {
-		this.ribbonIconEl.removeClass(ribbonActiveClassName);
-		new Notice('Stopping Auto Scroller');
-		window.clearInterval(this.intervalId);
-		this.active = false;
-	}
-	private performScroll() {
-		this.pixelfractionCounter += this.settings.speed;
-		if (this.pixelfractionCounter < 1)
-			return;
+	active = false;
+	private rafId: number | null = null;
+	private lastTs: number | null = null;
+	private pixelAccumulator = 0;
+	private lastTop: number | null = null;
 
-		const editor = app.workspace.getActiveViewOfType(MarkdownView)?.editor;
-		if (editor) {
-			const { top, left } = editor.getScrollInfo();
-			editor.scrollTo(left, top + this.pixelfractionCounter);
-			this.pixelfractionCounter %= 1;
+	// pausa temporária causada por wheel (retoma sozinho)
+	private pausedByWheel = false;
+	private wheelResumeTimer: number | null = null;
 
-			const { top: newTop } = editor.getScrollInfo();
-			if (top === newTop) {
-				new Notice('Scrolled to the end!');
-				this.stopScroll()
-			}
-		}
-		else {
-			new Notice('Editor view lost');
-			this.stopScroll()
-		}
-	}
+	ribbonIconEl: HTMLElement | null = null;
 
+	// listeners (precisam ser campos para remover depois)
+	private boundOnUserWheel = (_e: WheelEvent) => this.onUserWheel();
+	private boundOnUserKey = (_e: KeyboardEvent) => this.onUserScrollInteraction();
+	private boundOnUserMouse = (_e: MouseEvent) => this.onUserScrollInteraction();
+
+	// ====== Ciclo de vida ======
 	async onload() {
 		await this.loadSettings();
 
+		// Comandos + hotkeys (o usuário pode mudar em Settings → Hotkeys)
 		this.addCommand({
-			id: "toggle-scrolling",
-			name: "Autoscroller: toggle scrolling",
-			callback: () => {
-				if (this.active) {
-					this.stopScroll()
-				} else {
-					this.ribbonIconEl.addClass(ribbonActiveClassName);
-					new Notice('Starting Auto Scroller');
-					this.active = true;
-					this.intervalId = this.registerInterval(window.setInterval(() => this.performScroll(), 10));
-				}
-			},
-		})
+			id: 'toggle-scrolling',
+			name: 'AutoScroll Extended: toggle scrolling',
+			hotkeys: [{ modifiers: ['Mod', 'Alt'], key: 's' }],
+			callback: () => this.toggleScrolling(),
+		});
+
 		this.addCommand({
-			id: "increase-speed",
-			name: "Autoscroller: increase speed",
-			callback: async () => {
-				if (this.settings.speed >= 2) {
-					this.settings.speed = .1
-				} else {
-					// to mitigate precision issues (e.g. avoid .1 + .1 = .20000000001)
-					this.settings.speed = Math.round(this.settings.speed * 10 + 1) / 10
-				}
-				await this.saveSettings();
-				new Notice('Setting speed to ' + this.settings.speed);
-			},
-		})
+			id: 'increase-speed',
+			name: 'AutoScroll Extended: increase speed',
+			hotkeys: [{ modifiers: ['Mod', 'Alt'], key: '=' }], // +/=
+			callback: async () => this.bumpSpeed(+0.1),
+		});
+
 		this.addCommand({
-			id: "decrease-speed",
-			name: "Autoscroller: decrease speed",
-			callback: async () => {
-				if (this.settings.speed <= .1) {
-					this.settings.speed = 2;
-				} else {
-					// to mitigate precision issues (e.g. avoid .1 + .1 = .20000000001)
-					this.settings.speed = Math.round(this.settings.speed * 10 - 1) / 10;
-				}
-				await this.saveSettings();
-				new Notice('Setting speed to ' + this.settings.speed);
-			},
-		})
+			id: 'decrease-speed',
+			name: 'AutoScroll Extended: decrease speed',
+			hotkeys: [{ modifiers: ['Mod', 'Alt'], key: '-' }],
+			callback: async () => this.bumpSpeed(-0.1),
+		});
 
 		if (this.settings.showRibbonIcon) {
-			this.ribbonIconEl = this.addRibbonIcon('double-down-arrow-glyph', `Auto Scroller (speed ${this.settings.speed})`, e => {
-				if (e.button === 0) { // left mouse button
-					app.commands.executeCommandById(`${pluginId}:toggle-scrolling`);
-				} else { // right mouse button
-					app.commands.executeCommandById(`${pluginId}:increase-speed`);
-				}
-			})
+			this.createOrRefreshRibbon();
 		}
 
+		this.registerEvent(
+			this.app.workspace.on('active-leaf-change', () => {
+				this.resubscribeUserInteractionListeners();
+				this.lastTop = null; // força re-sync no próximo frame
+			})
+		);
+
 		this.addSettingTab(new AutoScrollSettingTab(this.app, this));
+		this.resubscribeUserInteractionListeners();
 	}
 
 	onunload() {
-		window.clearInterval(this.intervalId);
+		this.stopScroll();
+		this.removeRibbon();
+		this.unsubscribeUserInteractionListeners();
 	}
 
+	// ====== API invocada por comandos / ribbon ======
+
+	public toggleScrolling() {
+		if (this.active) this.stopScroll();
+		else this.startScroll();
+	}
+
+	public async bumpSpeed(step: number) {
+		const next = Math.round((this.settings.speed + step) * 10) / 10;
+		// wrap 0.1..2
+		this.settings.speed = next > 2 ? 0.1 : next < 0.1 ? 2 : next;
+		await this.saveSettingsAndRefreshUI();
+		new Notice('Setting speed to ' + this.settings.speed);
+	}
+
+	// ====== Loop de autoscroll ======
+	private startScroll() {
+		if (this.active) return;
+
+		this.active = true;
+		this.lastTs = null;
+		this.pixelAccumulator = 0;
+		this.lastTop = null;
+		this.pausedByWheel = false;
+		if (this.wheelResumeTimer) {
+			window.clearTimeout(this.wheelResumeTimer);
+			this.wheelResumeTimer = null;
+		}
+
+		this.ribbonIconEl?.addClass(ribbonActiveClassName);
+		new Notice('Starting Auto Scroller');
+
+		this.resubscribeUserInteractionListeners();
+
+		const tick = (ts: number) => {
+			if (!this.active) return;
+
+			// se está pausado por wheel, apenas aguarde retomar
+			if (this.pausedByWheel) {
+				this.lastTs = null; // rebaseia o delta quando retomar
+				this.rafId = requestAnimationFrame(tick);
+				return;
+			}
+
+			if (this.lastTs == null) this.lastTs = ts;
+			const dtMs = ts - this.lastTs;
+			this.lastTs = ts;
+
+			const pxPerMs = this.settings.speed / 10; // speed é px/10ms
+			this.pixelAccumulator += pxPerMs * dtMs;
+
+			if (this.pixelAccumulator >= 1) {
+				const target = this.getActiveScrollTarget();
+				if (!target) {
+					new Notice('Editor view lost');
+					this.stopScroll();
+					return;
+				}
+
+				const currentTop = target.getTop();
+
+				// Se o usuário mexeu (teclas/mouse down), re-sincronize (sem voltar)
+				if (this.lastTop !== null && Math.abs(currentTop - this.lastTop) > 2) {
+					this.pixelAccumulator = 0;
+				}
+
+				const delta = Math.floor(this.pixelAccumulator);
+				const desiredTop = currentTop + delta;
+
+				target.setTop(desiredTop);
+				this.pixelAccumulator -= delta;
+
+				const newTop = target.getTop();
+				if (newTop === currentTop) {
+					new Notice('Scrolled to the end!');
+					this.stopScroll();
+					return;
+				}
+
+				this.lastTop = newTop;
+			}
+
+			this.rafId = requestAnimationFrame(tick);
+		};
+
+		this.rafId = requestAnimationFrame(tick);
+	}
+
+	private stopScroll() {
+		if (!this.active) return;
+
+		this.ribbonIconEl?.removeClass(ribbonActiveClassName);
+		new Notice('Stopping Auto Scroller');
+
+		if (this.rafId != null) {
+			cancelAnimationFrame(this.rafId);
+			this.rafId = null;
+		}
+		if (this.wheelResumeTimer) {
+			window.clearTimeout(this.wheelResumeTimer);
+			this.wheelResumeTimer = null;
+		}
+		this.active = false;
+		this.pausedByWheel = false;
+		this.lastTs = null;
+		this.pixelAccumulator = 0;
+	}
+
+	// ====== Abstração do alvo (Editor / Reading) ======
+	private getActiveScrollTarget():
+		| {
+			type: 'editor' | 'reading';
+			getTop: () => number;
+			setTop: (top: number) => void;
+		}
+		| null {
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!view) return null;
+
+		if (view.getMode() === 'source') {
+			const editor = view.editor;
+			if (!editor) return null;
+			return {
+				type: 'editor',
+				getTop: () => editor.getScrollInfo().top,
+				setTop: (top: number) => {
+					const { left } = editor.getScrollInfo();
+					editor.scrollTo(left, top);
+				},
+			};
+		}
+
+		const el = view.containerEl.querySelector<HTMLElement>('.markdown-reading-view');
+		if (el) {
+			return {
+				type: 'reading',
+				getTop: () => el.scrollTop,
+				setTop: (top: number) => el.scrollTo({ top }),
+			};
+		}
+		// fallback: container do view
+		return {
+			type: 'reading',
+			getTop: () => view.containerEl.scrollTop,
+			setTop: (top: number) => view.containerEl.scrollTo({ top }),
+		};
+	}
+
+	// ====== Interação do usuário ======
+
+	// Qualquer tecla / mousedown apenas muda a linha de base (não pausa)
+	private onUserScrollInteraction() {
+		if (!this.active) return;
+		this.lastTop = null;
+	}
+
+	// Wheel: pausa imediatamente e agenda a retomada automática
+	private onUserWheel() {
+		if (!this.active) return;
+
+		// pausa só por wheel
+		this.pausedByWheel = true;
+		this.pixelAccumulator = 0;
+		this.lastTop = null;
+		this.lastTs = null;
+
+		if (this.wheelResumeTimer) {
+			window.clearTimeout(this.wheelResumeTimer);
+		}
+		this.wheelResumeTimer = window.setTimeout(() => {
+			// retoma do ponto atual
+			this.pausedByWheel = false;
+			this.lastTop = null;
+			this.lastTs = null; // rebaseia o tempo para evitar “pulo”
+		}, WHEEL_RESUME_DELAY_MS);
+	}
+
+	private resubscribeUserInteractionListeners() {
+		this.unsubscribeUserInteractionListeners();
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		const container = view?.containerEl ?? this.app.workspace.containerEl;
+		container.addEventListener('wheel', this.boundOnUserWheel, { passive: true });
+		container.addEventListener('keydown', this.boundOnUserKey, true); // capture
+		container.addEventListener('mousedown', this.boundOnUserMouse, { passive: true });
+	}
+
+	private unsubscribeUserInteractionListeners() {
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		const container = view?.containerEl ?? this.app.workspace.containerEl;
+		container.removeEventListener('wheel', this.boundOnUserWheel as EventListener);
+		container.removeEventListener('keydown', this.boundOnUserKey as EventListener, true);
+		container.removeEventListener('mousedown', this.boundOnUserMouse as EventListener);
+	}
+
+	// ====== Ribbon & UI ======
+	public createOrRefreshRibbon() {
+		this.removeRibbon();
+		this.ribbonIconEl = this.addRibbonIcon(
+			'double-down-arrow-glyph',
+			this.ribbonTooltip(),
+			(e) => {
+				if (e.button === 0) {
+					this.toggleScrolling();
+				} else {
+					void this.bumpSpeed(+0.1);
+				}
+			}
+		);
+		if (this.active) this.ribbonIconEl.addClass(ribbonActiveClassName);
+	}
+
+	public removeRibbon() {
+		this.ribbonIconEl?.remove();
+		this.ribbonIconEl = null;
+	}
+
+	private ribbonTooltip() {
+		return `AutoScroll Extended (speed ${this.settings.speed})`;
+	}
+
+	public async saveSettingsAndRefreshUI() {
+		this.settings.speed = Math.max(0.1, Math.min(2, Number(this.settings.speed) || 0.1));
+		await this.saveSettings();
+
+		if (this.ribbonIconEl) {
+			const tip = this.ribbonTooltip();
+			this.ribbonIconEl.setAttr('aria-label', tip);
+			this.ribbonIconEl.setAttr('data-tooltip', tip);
+		}
+	}
+
+	// ====== Settings persistence ======
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const data = await this.loadData();
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, data ?? {});
+		if (typeof this.settings.speed !== 'number' || isNaN(this.settings.speed))
+			this.settings.speed = DEFAULT_SETTINGS.speed;
+		this.settings.speed = Math.max(0.1, Math.min(2, this.settings.speed));
+		if (typeof this.settings.showRibbonIcon !== 'boolean')
+			this.settings.showRibbonIcon = DEFAULT_SETTINGS.showRibbonIcon;
 	}
 
 	async saveSettings() {
@@ -129,43 +348,35 @@ class AutoScrollSettingTab extends PluginSettingTab {
 
 	display(): void {
 		const { containerEl } = this;
-
 		containerEl.empty();
 
-		containerEl.createEl('h2', { text: 'Settings for Autoscroll Plugin' });
+		containerEl.createEl('h2', { text: 'Settings • AutoScroll Extended' });
 
 		new Setting(containerEl)
 			.setName('Show Ribbon Icon')
-			.addToggle(toggle => toggle
-				.setValue(true)
-				.onChange(value => {
-					this.plugin.settings.showRibbonIcon = value;
-					this.plugin.saveSettings();
-					if (value) {
-						this.plugin.ribbonIconEl = this.plugin.addRibbonIcon('double-down-arrow-glyph', `Auto Scroller (speed ${this.plugin.settings.speed})`, e => {
-							if (e.button === 0) { // left mouse button
-								app.commands.executeCommandById(`${pluginId}:toggle-scrolling`);
-							} else { // right mouse button
-								app.commands.executeCommandById(`${pluginId}:increase-speed`);
-							}
-						})
-					} else {
-						this.plugin.ribbonIconEl?.remove();
-					}
-				})
-			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.showRibbonIcon)
+					.onChange(async (value) => {
+						this.plugin.settings.showRibbonIcon = value;
+						await this.plugin.saveSettings();
+						if (value) this.plugin.createOrRefreshRibbon();
+						else this.plugin.removeRibbon();
+					})
+			);
 
 		new Setting(containerEl)
 			.setName('Default scrolling speed')
-			.setDesc('The number of pixels to pass in 10 ms')
-			.addSlider(slider => slider
-				.setLimits(.1, 2, .1)
-				.setValue(this.plugin.settings.speed)
-				.setDynamicTooltip()
-				.onChange(async (value) => {
-					this.plugin.settings.speed = value;
-					await this.plugin.saveSettings();
-				})
-			)
+			.setDesc('Pixels per 10 ms')
+			.addSlider((slider) =>
+				slider
+					.setLimits(0.1, 2, 0.1)
+					.setValue(this.plugin.settings.speed)
+					.setDynamicTooltip()
+					.onChange(async (value) => {
+						this.plugin.settings.speed = value;
+						await this.plugin.saveSettingsAndRefreshUI();
+					})
+			);
 	}
 }
