@@ -13,8 +13,16 @@ interface AutoScrollSettings {
 	showRibbonIcon: boolean;
 }
 
+// ===== Faixa/escala novas (lento → até 0.30) =====
+const MIN_SPEED = 0.01;     // 1 px/s
+const MAX_SPEED = 0.30;     // 30 px/s
+const SPEED_STEP = 0.01;    // passo fino para slider/atalhos
+
+// ===== Default calculado para leitura “normal” =====
+// Aproximação: 220 wpm, ~12 palavras/linha, line-height ~24 px
+// → ~0.31 linha/s → ~7.3 px/s → 0.073 px/10ms  ≈ 0.07
 const DEFAULT_SETTINGS: AutoScrollSettings = {
-	speed: 0.2,
+	speed: 0.07,
 	showRibbonIcon: true,
 };
 
@@ -60,14 +68,14 @@ export default class AutoScrollPlugin extends Plugin {
 			id: 'increase-speed',
 			name: 'AutoScroll Extended: increase speed',
 			hotkeys: [{ modifiers: ['Mod', 'Alt'], key: '=' }], // +/=
-			callback: async () => this.bumpSpeed(+0.1),
+			callback: async () => this.bumpSpeed(+SPEED_STEP),
 		});
 
 		this.addCommand({
 			id: 'decrease-speed',
 			name: 'AutoScroll Extended: decrease speed',
 			hotkeys: [{ modifiers: ['Mod', 'Alt'], key: '-' }],
-			callback: async () => this.bumpSpeed(-0.1),
+			callback: async () => this.bumpSpeed(-SPEED_STEP),
 		});
 
 		if (this.settings.showRibbonIcon) {
@@ -99,11 +107,11 @@ export default class AutoScrollPlugin extends Plugin {
 	}
 
 	public async bumpSpeed(step: number) {
-		const next = Math.round((this.settings.speed + step) * 10) / 10;
-		// wrap 0.1..2
-		this.settings.speed = next > 2 ? 0.1 : next < 0.1 ? 2 : next;
+		const next = Math.round((this.settings.speed + step) * 100) / 100;
+		// wrap MIN..MAX
+		this.settings.speed = next > MAX_SPEED ? MIN_SPEED : next < MIN_SPEED ? MAX_SPEED : next;
 		await this.saveSettingsAndRefreshUI();
-		new Notice('Setting speed to ' + this.settings.speed);
+		new Notice('Setting speed to ' + this.settings.speed.toFixed(2));
 	}
 
 	// ====== Loop de autoscroll ======
@@ -295,7 +303,7 @@ export default class AutoScrollPlugin extends Plugin {
 				if (e.button === 0) {
 					this.toggleScrolling();
 				} else {
-					void this.bumpSpeed(+0.1);
+					void this.bumpSpeed(+SPEED_STEP);
 				}
 			}
 		);
@@ -308,11 +316,12 @@ export default class AutoScrollPlugin extends Plugin {
 	}
 
 	private ribbonTooltip() {
-		return `AutoScroll Extended (speed ${this.settings.speed})`;
+		return `AutoScroll Extended (speed ${this.settings.speed.toFixed(2)} px/10ms)`;
 	}
 
 	public async saveSettingsAndRefreshUI() {
-		this.settings.speed = Math.max(0.1, Math.min(2, Number(this.settings.speed) || 0.1));
+		// clamp novo
+		this.settings.speed = Math.max(MIN_SPEED, Math.min(MAX_SPEED, Number(this.settings.speed) || DEFAULT_SETTINGS.speed));
 		await this.saveSettings();
 
 		if (this.ribbonIconEl) {
@@ -328,7 +337,7 @@ export default class AutoScrollPlugin extends Plugin {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, data ?? {});
 		if (typeof this.settings.speed !== 'number' || isNaN(this.settings.speed))
 			this.settings.speed = DEFAULT_SETTINGS.speed;
-		this.settings.speed = Math.max(0.1, Math.min(2, this.settings.speed));
+		this.settings.speed = Math.max(MIN_SPEED, Math.min(MAX_SPEED, this.settings.speed));
 		if (typeof this.settings.showRibbonIcon !== 'boolean')
 			this.settings.showRibbonIcon = DEFAULT_SETTINGS.showRibbonIcon;
 	}
@@ -367,10 +376,10 @@ class AutoScrollSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Default scrolling speed')
-			.setDesc('Pixels per 10 ms')
+			.setDesc('Pixels per 10 ms (slow → 0.30)')
 			.addSlider((slider) =>
 				slider
-					.setLimits(0.1, 2, 0.1)
+					.setLimits(MIN_SPEED, MAX_SPEED, SPEED_STEP)
 					.setValue(this.plugin.settings.speed)
 					.setDynamicTooltip()
 					.onChange(async (value) => {
